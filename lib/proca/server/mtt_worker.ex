@@ -31,13 +31,19 @@ defmodule Proca.Server.MTTWorker do
   require Logger
 
   @default_locale "en"
+  @recent_test_messages -1 * 60 * 60 * 24
 
   def process_mtt_campaign(campaign) do
     campaign = Repo.preload(campaign, [:mtt, [org: :email_backend]])
 
     if campaign.org.email_backend != nil and within_sending_window(campaign) do
+      # `all_cycles` is the total number of sending hours for the entire MTT campaign.
+      # `cycle` is the number of sending hours that have passed so far.
+      # The ratio of `cycle` to `all_cycles` determines what percentage of total
+      # emails should have been sent by this point, ensuring a linear send rate over the campaign's duration.
       {cycle, all_cycles} = calculate_cycles(campaign)
       target_ids = get_sendable_target_ids(campaign)
+      limit_per_hour = max_messages_per_hour(campaign)
 
       :telemetry.execute(
         [:proca, :mtt],
@@ -50,11 +56,9 @@ defmodule Proca.Server.MTTWorker do
       )
 
       # Send via central campaign.org.email_backend
-      # send_emails(campaign, get_test_emails_to_send(target_ids), true)
-      # send_emails(campaign, get_emails_to_send(target_ids, {cycle, all_cycles}))
       Enum.chunk_every(target_ids, 10)
       |> Enum.each(fn target_ids ->
-        emails_to_send = get_emails_to_send(target_ids, {cycle, all_cycles})
+        emails_to_send = get_emails_to_send(target_ids, {cycle, all_cycles}, limit_per_hour)
 
         Logger.info(
           "MTT worker #{campaign.name}: Sending #{length(emails_to_send)} emails for chunk of targets: #{inspect(target_ids)}, cycle #{cycle}/#{all_cycles}"
@@ -73,8 +77,11 @@ defmodule Proca.Server.MTTWorker do
       # send via each action page owner
     else
       if campaign.org.email_backend == nil do
-          Logger.error("MTT #{campaign.name} cannot send because #{campaign.org.name} org does not have an email backend")
+        Logger.error(
+          "MTT #{campaign.name} cannot send because #{campaign.org.name} org does not have an email backend"
+        )
       end
+
       :noop
     end
   end
@@ -101,7 +108,6 @@ defmodule Proca.Server.MTTWorker do
     end
   end
 
-  @recent_test_messages -1 * 60 * 60 * 24
   def get_test_emails_to_send() do
     # lets just send recent messages
     recent = DateTime.utc_now() |> DateTime.add(@recent_test_messages, :second)
@@ -140,18 +146,55 @@ defmodule Proca.Server.MTTWorker do
   end
 
   @doc """
-  Return {current_cycle, all_cycles} tuple to know where we are in the schedule
+  Calculates the campaign's progress in terms of sending "cycles".
+
+  A "cycle" corresponds to one hour within the allowed daily sending window,
+  as defined by the campaign's `start_at` and `end_at` times.
+
+  This function returns a tuple `{current_cycle, total_cycles}` where:
+  - `total_cycles` is the total number of sending hours for the entire duration
+    of the campaign.
+  - `current_cycle` is the number of sending hours that have already passed
+    since the campaign started.
+
+  The ratio of `current_cycle` to `total_cycles` is used to determine the
+  proportion of emails that should have been sent by the current time,
+  ensuring a linear distribution of emails over the campaign's lifetime.
+
+  ### Example
+
+  Campaign has the following settings:
+  - `start_at`: `~U[2025-09-05 09:00:00Z]`
+  - `end_at`: `~U[2025-09-07 17:00:00Z]`
+
+  And the current time is `~U[2025-09-05 11:46:00Z]`.
+
+  The function calculates progress by determining how many cycles are *left*
+  and subtracting that from the total.
+
+  - The sending window is 8 hours/day (from 09:00 to 17:00). The campaign runs
+    for 3 days. `total_cycles` will be `3 * 8 = 24`.
+  - There is 1 full day remaining after today. That's `1 * 8 = 8` cycles.
+  - In the current day, the time is 11:30. The window ends at 17:00. The number
+    of full hours remaining is `floor(17:00 - 11:30) = 5` cycles.
+  - Total cycles remaining = `8 + 5 = 13`.
+  - `current_cycle` = `total_cycles - cycles_remaining` = `24 - 13 = 11`.
+
+  The function would return `{3, 24}`.
   """
-  def calculate_cycles(_campaign = %Campaign{mtt: %{start_at: start_at, end_at: end_at}}) do
+  def calculate_cycles(
+        %Campaign{mtt: %{start_at: start_at, end_at: end_at}},
+        now \\ DateTime.utc_now()
+      ) do
     # cycles run in office hours, not 24h, per day it is:
     cycles_per_day = calculate_cycles_in_day(start_at, end_at)
     # cycles left today:
-    cycles_today = calculate_cycles_in_day(Time.utc_now(), end_at)
+    cycles_today = calculate_cycles_in_day(now, end_at)
 
     # add +1 to count current day. We validated end_at > start_at, so it's 1 day even if it's a 5 minute one
     all_days = Date.diff(end_at, start_at) + 1
     # how many days behind us
-    days_left = Date.diff(end_at, Date.utc_today())
+    days_left = Date.diff(end_at, now)
 
     total_cycles = all_days * cycles_per_day
 
@@ -162,11 +205,8 @@ defmodule Proca.Server.MTTWorker do
     }
   end
 
-  def calculate_cycles_in_day(start_time, end_time) do
-    mins_per_cycles = Application.get_env(:proca, Proca)[:mtt_cycle_time]
-    time_diff = Integer.floor_div(Time.diff(end_time, start_time, :second), 60)
-
-    div(time_diff, mins_per_cycles)
+  defp calculate_cycles_in_day(start_time, end_time) do
+    Time.diff(end_time, start_time, :hour)
   end
 
   @doc """
@@ -188,7 +228,7 @@ defmodule Proca.Server.MTTWorker do
     in_sending_days and in_sending_time
   end
 
-  def get_emails_to_send(target_ids, {cycle, all_cycles}) do
+  def get_emails_to_send(target_ids, {cycle, all_cycles}, limit_per_hour) do
     # Subquery to count delivered/goal messages for each target
     progress_per_target =
       Message.select_by_targets(target_ids, [false, true])
@@ -212,7 +252,7 @@ defmodule Proca.Server.MTTWorker do
       # <= because rank is 1-based
       |> where([r, p], p.sent + r.rank <= p.goal)
       |> select([r, p], r.message_id)
-      |> limit(^max_messages_per_cycle())
+      |> limit(^limit_per_hour)
 
     # Finally, fetch these messages with associations in one go
     Repo.all(
@@ -291,10 +331,14 @@ defmodule Proca.Server.MTTWorker do
         case EmailBackend.deliver(batch, org, templates[locale]) do
           :ok ->
             batch
-            |> Enum.flat_map(fn m -> case m.private.email_id do
-              nil -> []
-              id -> [id]
-             end
+            |> Enum.flat_map(fn m ->
+              case m.private.email_id do
+                nil ->
+                  []
+
+                id ->
+                  [id]
+              end
             end)
             |> TargetEmail.mark_all(:active)
 
@@ -302,6 +346,7 @@ defmodule Proca.Server.MTTWorker do
 
           {:error, statuses} ->
             Logger.error("MTT failed to send, statuses: #{inspect(statuses)}")
+
             Enum.zip(chunk, statuses)
             |> Enum.filter(fn
               {_, :ok} -> true
@@ -401,13 +446,30 @@ defmodule Proca.Server.MTTWorker do
   defp maybe_add_cc(email, cc, true), do: Email.cc(email, cc)
   defp maybe_add_cc(email, _cc, false), do: email
 
-  defp max_messages_per_cycle() do
-    max_messages = Application.get_env(:proca, __MODULE__)[:max_messages_per_cycle]
+  def max_messages_per_hour(%Campaign{mtt: %{max_messages_per_hour: _, timezone: nil}} = campaign) do
+    mtt = %{campaign.mtt | timezone: "Etc/UTC"}
+    campaign = %{campaign | mtt: mtt}
 
-    if max_messages < 1 do
-      1
-    else
-      max_messages
-    end
+    max_messages_per_hour(campaign)
+  end
+
+  def max_messages_per_hour(%Campaign{mtt: %{max_messages_per_hour: nil, timezone: _}} = campaign) do
+    limit_messages_per_hour =
+      Application.get_env(:proca, Proca.Server.MTTWorker)
+      |> Access.get(:max_emails_per_hour, 30)
+
+    mtt = %{campaign.mtt | max_messages_per_hour: limit_messages_per_hour}
+    campaign = %{campaign | mtt: mtt}
+
+    max_messages_per_hour(campaign)
+  end
+
+  def max_messages_per_hour(%Campaign{mtt: %{max_messages_per_hour: max_messages_per_hour, timezone: timezone}}) do
+    Application.get_env(:proca, Proca.Server.MTTWorker)
+    |> Access.get(:messages_ratio_per_hour)
+    |> Access.get(DateTime.now!(timezone).hour)
+    |> Kernel.*(max_messages_per_hour)
+    |> trunc()
+    |> max(1)
   end
 end

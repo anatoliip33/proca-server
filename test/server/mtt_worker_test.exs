@@ -1,6 +1,9 @@
 defmodule Proca.Server.MTTWorkerTest do
   use Proca.DataCase
 
+  import Ecto.Query
+  import Proca.Repo
+
   import Proca.StoryFactory, only: [green_story: 0]
   alias Proca.Factory
 
@@ -14,8 +17,8 @@ defmodule Proca.Server.MTTWorkerTest do
     green_story()
   end
 
-  test "10 minutes is 3 cycles of 3 minutes", %{campaign: c} do
-    assert MTTWorker.calculate_cycles(c) == {0, 3}
+  test "3 days campaign for 8 hours each day is 24 cycles", %{campaign: c} do
+    assert MTTWorker.calculate_cycles(c) == {1, 16}
   end
 
   test "We are in sending window", %{campaign: c} do
@@ -55,7 +58,9 @@ defmodule Proca.Server.MTTWorkerTest do
       }
     end
 
-    test "return all testing mtts at once", %{campaign: c, ap: ap, targets: ts} do
+    test "return all testing mtts at once", %{campaign: c, ap: ap, targets: ts, test_messages: test_messages, live_messages: live_messages} do
+      limit_messages_per_hour = MTTWorker.max_messages_per_hour(c)
+
       tids = MTTWorker.get_sendable_target_ids(c)
       assert length(tids) == 10
 
@@ -63,46 +68,30 @@ defmodule Proca.Server.MTTWorkerTest do
       assert length(emails) == 0
 
       emails = MTTWorker.get_test_emails_to_send()
-      assert length(emails) == 3
+      assert length(emails) == test_messages |> length()
 
       # Before dupe rank was run:
-      emails = MTTWorker.get_emails_to_send(tids, {700, 700})
+      emails = MTTWorker.get_emails_to_send(tids, {700, 700}, limit_messages_per_hour)
       assert length(emails) == 0
 
       assert {:ok, _} = Proca.Server.MTT.dupe_rank()
 
-      emails = MTTWorker.get_emails_to_send(tids, {1, 700})
+      emails = MTTWorker.get_emails_to_send(tids, {1, 700}, limit_messages_per_hour)
       assert length(emails) == 0
 
-      emails = MTTWorker.get_emails_to_send(tids, {700, 700})
-      assert length(emails) == 7
+      emails = MTTWorker.get_emails_to_send(tids, {700, 700}, limit_messages_per_hour)
+      assert length(emails) == live_messages |> length()
 
       # we have 3 test emails and 7 live emails (one per target), so at 699 we still do not send that one i guess?
-      emails = MTTWorker.get_emails_to_send(tids, {699, 700})
+      emails = MTTWorker.get_emails_to_send(tids, {699, 700}, limit_messages_per_hour)
       assert length(emails) == 0
     end
-  end
-
-  def move_schedule(%{id: id}, past_mins, future_mins) do
-    import Ecto.Query
-    import Proca.Repo
-
-    now = DateTime.utc_now()
-    start_at = DateTime.add(now, -60 * past_mins, :second)
-    end_at = DateTime.add(now, 60 * future_mins, :second)
-
-    update_all(from(mtt in Proca.MTT, where: mtt.campaign_id == ^id),
-      set: [start_at: start_at, end_at: end_at]
-    )
-
-    Proca.Campaign.one(id: id, preload: [:mtt])
-    |> MTTWorker.calculate_cycles()
   end
 
   describe "scheduling messages for one target" do
     setup %{campaign: c, ap: ap, targets: [t1 | _]} do
       actions =
-        Factory.insert_list(20, :action,
+        Factory.insert_list(1000, :action,
           action_page: ap,
           processing_status: :delivered,
           supporter_processing_status: :accepted
@@ -119,33 +108,55 @@ defmodule Proca.Server.MTTWorkerTest do
       }
     end
 
-    test "Test sending on schedule", %{actions: actions, campaign: c, target: %{id: tid}} do
-      # cycle is every 3 mins, so have 10 cycles
-      # 0..2.59 - send 2
-      # 3..5.59 - send 2
-      # 6..8.59 - send 2
-      # 9..11.59 ..
-      # 12..14.59
-      # last cycle: 27:00->29.59
-      count = length(actions)
+    test "sending on schedule with injected time", %{actions: actions, campaign: c, target: %{id: tid}} do
+      start_at = ~U[2025-09-05 09:00:00Z]
+      end_at = ~U[2025-09-07 17:00:00Z] # 3 days, 8 hours per day = 24 cycles.
 
-      cycle = move_schedule(c, 1, 29)
-      emails = MTTWorker.get_emails_to_send([tid], cycle)
-      assert length(emails) == 2
-      Message.mark_all(emails, :sent)
+      # To avoid flakiness from `max_messages_per_hour`, which can depend on the
+      # current time, we set a high limit on the campaign itself. This makes
+      # the test focus on the throttling logic.
+      mtt = Proca.Repo.get_by!(Proca.MTT, campaign_id: c.id)
 
-      # in second cycle
-      cycle = move_schedule(c, 5, 25)
-      emails = MTTWorker.get_emails_to_send([tid], cycle)
-      assert length(emails) == 2
-      Message.mark_all(emails, :sent)
+      mtt_changeset =
+        Proca.MTT.changeset(mtt, %{
+          start_at: start_at,
+          end_at: end_at,
+          max_messages_per_hour: 100
+        })
 
-      # in second cycle
-      cycle = move_schedule(c, 29, 1)
-      emails = MTTWorker.get_emails_to_send([tid], cycle)
-      # all remining, because we skipped to last cycle
-      assert length(emails) == count - 4
-      Message.mark_all(emails, :sent)
+      Proca.Repo.update!(mtt_changeset)
+
+      campaign = Proca.Campaign.one(id: c.id, preload: [:mtt])
+
+      # First hour of campaign
+      now1 = ~U[2025-09-05 09:01:00Z]
+      limit1 = 80
+
+      {cycle1, all_cycles1} = MTTWorker.calculate_cycles(campaign, now1)
+      assert {cycle1, all_cycles1} == {1, 24}
+      emails1 = MTTWorker.get_emails_to_send([tid], {cycle1, all_cycles1}, limit1)
+      assert length(emails1) == 41
+      Message.mark_all(emails1, :sent)
+
+      # Middle of campaign
+      now2 = ~U[2025-09-06 12:01:00Z]
+      limit2 = 70
+
+      {cycle2, all_cycles2} = MTTWorker.calculate_cycles(campaign, now2)
+      assert {cycle2, all_cycles2} == {12, 24}
+      emails2 = MTTWorker.get_emails_to_send([tid], {cycle2, all_cycles2}, limit2)
+      assert length(emails2) == limit2
+      Message.mark_all(emails2, :sent)
+
+      # End of campaign - send the rest
+      now3 = ~U[2025-09-07 16:01:00Z]
+      limit3 = 90
+
+      {cycle3, all_cycles3} = MTTWorker.calculate_cycles(campaign, now3)
+      assert {cycle3, all_cycles3} == {24, 24}
+      emails3 = MTTWorker.get_emails_to_send([tid], {cycle3, all_cycles3}, limit3)
+      assert length(emails3) == limit3
+      Message.mark_all(emails3, :sent)
     end
 
     test "test sending", %{campaign: c, target: %{id: tid, emails: [%{email: email}]}} do

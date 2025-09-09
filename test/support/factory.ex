@@ -236,8 +236,11 @@ defmodule Proca.Factory do
 
   def mtt_factory do
     %Proca.MTT{
+      timezone: "Europe/Kyiv",
       start_at: DateTime.utc_now(),
-      end_at: DateTime.utc_now() |> DateTime.add(600, :second)
+      end_at:
+        DateTime.utc_now()
+        |> DateTime.add(32, :hour)
     }
   end
 end
